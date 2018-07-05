@@ -6,7 +6,7 @@ import subprocess
 import time
 import numpy as np
 from pandas import read_csv
-from  matplotlib import rcParams
+from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 from matplotlib.gridspec import GridSpec
@@ -28,6 +28,7 @@ Version = 'PID-Analyzer 0.52'
 
 LOG_MIN_BYTES = 500000
 
+
 class Trace:
     framelen = 1.           # length of each single frame over which to compute response
     resplen = 0.5           # length of respose window
@@ -38,100 +39,197 @@ class Trace:
     noise_framelen = 0.3    # window width for noise analysis
     noise_superpos = 16     # subsampling for noise analysis windows
 
-    def __init__(self, data):
+    def __init__(self, data, keep=None, response_compare=None):
         self.data = data
-        self.input = self.equalize(data['time'], self.pid_in(data['p_err'], data['gyro'], data['P']))[1]  # /20.
+        self.input = self.equalize(data['time'],
+                                   self.pid_in(data['p_err'],
+                                               data['gyro'],
+                                               data['P']))[1]  # /20.
         self.data.update({'input': self.pid_in(data['p_err'], data['gyro'], data['P'])})
         self.equalize_data()
 
         self.name = self.data['name']
         self.time = self.data['time']
-        self.dt=self.time[0]-self.time[1]
+        self.dt = self.time[0] - self.time[1]
 
         self.input = self.data['input']
-        #enable this to generate artifical gyro trace with known system response
-        #self.data['gyro']=self.toy_out(self.input, delay=0.01, mode='normal')####
+        # enable this to generate artifical gyro trace with known system response
+        # self.data['gyro']=self.toy_out(self.input, delay=0.01, mode='normal')####
 
         self.gyro = self.data['gyro']
         self.throttle = self.data['throttle']
-        self.throt_hist, self.throt_scale = np.histogram(self.throttle, np.linspace(0, 100, 101, dtype=np.float64), normed=True)
+        self.throt_hist, self.throt_scale = np.histogram(
+            self.throttle,
+            np.linspace(0, 100, 101, dtype=np.float64),
+            normed=True)
 
-        self.flen = self.stepcalc(self.time, Trace.framelen)        # array len corresponding to framelen in s
-        self.rlen = self.stepcalc(self.time, Trace.resplen)         # array len corresponding to resplen in s
-        self.time_resp = self.time[0:self.rlen]-self.time[0]
+        self.flen = self.stepcalc(self.time, Trace.framelen)  # array len corresponding to framelen in s
+        self.rlen = self.stepcalc(self.time, Trace.resplen)  # array len corresponding to resplen in s
+        self.time_resp = self.time[0:self.rlen] - self.time[0]
 
-        self.stacks = self.winstacker({'time':[],'input':[],'gyro':[], 'throttle':[]}, self.flen, Trace.superpos)                                  # [[time, input, output],]
-        self.window = np.hanning(self.flen)                                     #self.tukeywin(self.flen, self.tuk_alpha)
-        self.spec_sm, self.avr_t, self.avr_in, self.max_in, self.max_thr = self.stack_response(self.stacks, self.window)
-        self.low_mask, self.high_mask = self.low_high_mask(self.max_in, self.threshold)       #calcs masks for high and low inputs according to threshold
-        self.toolow_mask = self.low_high_mask(self.max_in, 20)[1]          #mask for ignoring noisy low input
+        self.stacks = self.winstacker({'time': [],
+                                       'input': [],
+                                       'gyro': [],
+                                       'throttle': []},
+                                      self.flen,
+                                      Trace.superpos)  # [[time, input, output],]
+        self.window = np.hanning(self.flen)  # self.tukeywin(self.flen, self.tuk_alpha)
+        (self.spec_sm,
+         self.avr_t,
+         self.avr_in,
+         self.max_in,
+         self.max_thr) = self.stack_response(self.stacks, self.window)
 
-        self.resp_sm = self.weighted_mode_avr(self.spec_sm, self.toolow_mask, [-1.5,3.5], 1000)
-        self.resp_quality = -self.to_mask((np.abs(self.spec_sm -self.resp_sm[0]).mean(axis=1)).clip(0.5-1e-9,0.5))+1.
+        compare_methods = {"rate": self.max_in,
+                           "throttle": self.max_thr,
+                           "time": self.avr_t}
+
+        if keep is None:
+            keep = [self.avr_t[0], self.avr_t[-1]]
+        else:
+            keep = [self.avr_t[int((len(self.avr_t) - 1) * (int(x) / 100.0))] for x in keep]
+
+        if response_compare is None:
+            compare = compare_methods["rate"]
+            compare_thresholds = [self.threshold]
+        else:
+            compare = compare_methods[response_compare[0]]
+            if response_compare[0] == "time":
+                compare_thresholds = [self.avr_t[int((len(self.avr_t) - 1) * (int(x) / 100.0))]
+                                      for x in response_compare[1]]
+            else:
+                compare_thresholds = [int(x) for x in response_compare[1]]
+
+        self.masks = self.low_high_masks(compare, compare_thresholds)
+        self.response_labels = ['%s %s-%s' % (response_compare[0],
+                                              compare_thresholds[x],
+                                              compare_thresholds[x + 1])
+                                for x in range(len(compare_thresholds) - 1)]
+
+        # mask for ignoring noisy low input
+        self.toolow_mask = self.low_high_masks(self.max_in, [20, 10000])[0]
+
+        self.keep_mask = self.low_high_masks(self.avr_t, keep)[0]
+
+        self.resp_sm = self.weighted_mode_avr(self.spec_sm,
+                                              self.toolow_mask,
+                                              [-1.5, 3.5],
+                                              1000)
+        self.resp_quality = -self.to_mask(
+            (np.abs(self.spec_sm - self.resp_sm[0]).mean(axis=1)).clip(0.5 - 1e-9, 0.5)) + 1.
         # masking by setting trottle of unwanted traces to neg
-        self.thr_response = self.hist2d(self.max_thr * (2. * (self.toolow_mask*self.resp_quality) - 1.), self.time_resp,
-                                        (self.spec_sm.transpose() * self.toolow_mask).transpose(), [101, self.rlen])
+        self.thr_response = self.hist2d(
+            self.max_thr * (2. * (self.toolow_mask * self.resp_quality) - 1.),
+            self.time_resp,
+            (self.spec_sm.transpose() * self.toolow_mask).transpose(),
+            [101, self.rlen])
 
-        self.resp_low = self.weighted_mode_avr(self.spec_sm, self.low_mask*self.toolow_mask, [-1.5,3.5], 1000)
-        if self.high_mask.sum()>0:
-            self.resp_high = self.weighted_mode_avr(self.spec_sm, self.high_mask*self.toolow_mask, [-1.5,3.5], 1000)
+        self.responses = []
+        for mask in self.masks:
+            self.responses.append(
+                self.weighted_mode_avr(self.spec_sm,
+                                       mask * self.toolow_mask * self.keep_mask,
+                                       [-1.5, 3.5],
+                                       1000))
+
+        # self.resp_low = self.weighted_mode_avr(self.spec_sm,
+        #                                        self.low_mask * self.toolow_mask,
+        #                                        [-1.5,3.5],
+        #                                        1000)
+        # if self.high_mask.sum() > 0:
+        #    self.resp_high = self.weighted_mode_avr(self.spec_sm,
+        #                                            self.high_mask * self.toolow_mask,
+        #                                            [-1.5, 3.5],
+        #                                            1000)
 
         self.noise_winlen = self.stepcalc(self.time, Trace.noise_framelen)
-        self.noise_stack = self.winstacker({'time':[], 'gyro':[], 'throttle':[], 'd_err':[], 'debug':[]},
-                                           self.noise_winlen, Trace.noise_superpos)
+        self.noise_stack = self.winstacker({'time': [],
+                                            'gyro': [],
+                                            'throttle': [],
+                                            'd_err': [],
+                                            'debug': []},
+                                           self.noise_winlen,
+                                           Trace.noise_superpos)
         self.noise_win = np.hanning(self.noise_winlen)
 
-        self.noise_gyro = self.stackspectrum(self.noise_stack['time'],self.noise_stack['throttle'],self.noise_stack['gyro'], self.noise_win)
-        self.noise_d = self.stackspectrum(self.noise_stack['time'], self.noise_stack['throttle'], self.noise_stack['d_err'], self.noise_win)
-        self.noise_debug = self.stackspectrum(self.noise_stack['time'], self.noise_stack['throttle'], self.noise_stack['debug'], self.noise_win)
-        if self.noise_debug['hist2d'].sum()>0:
-            ## mask 0 entries
-            thr_mask = self.noise_gyro['throt_hist_avr'].clip(0,1)
-            self.filter_trans = np.average(self.noise_gyro['hist2d'], axis=1, weights=thr_mask)/\
-                                np.average(self.noise_debug['hist2d'], axis=1, weights=thr_mask)
+        self.noise_gyro = self.stackspectrum(self.noise_stack['time'],
+                                             self.noise_stack['throttle'],
+                                             self.noise_stack['gyro'],
+                                             self.noise_win)
+        self.noise_d = self.stackspectrum(self.noise_stack['time'],
+                                          self.noise_stack['throttle'],
+                                          self.noise_stack['d_err'],
+                                          self.noise_win)
+        self.noise_debug = self.stackspectrum(self.noise_stack['time'],
+                                              self.noise_stack['throttle'],
+                                              self.noise_stack['debug'],
+                                              self.noise_win)
+        if self.noise_debug['hist2d'].sum() > 0:
+            # mask 0 entries
+            thr_mask = self.noise_gyro['throt_hist_avr'].clip(0, 1)
+            self.filter_trans = (
+                np.average(self.noise_gyro['hist2d'], axis=1, weights=thr_mask) /
+                np.average(self.noise_debug['hist2d'], axis=1, weights=thr_mask))
         else:
-            self.filter_trans = self.noise_gyro['hist2d'].mean(axis=1)*0.
+            self.filter_trans = self.noise_gyro['hist2d'].mean(axis=1) * 0.
 
     @staticmethod
-    def low_high_mask(signal, threshold):
-        low = np.copy(signal)
+    def low_high_masks(signal, thresholds):
+        # thresholds = [None] + thresholds
 
-        low[low <=threshold] = 1.
-        low[low > threshold] = 0.
-        high = -low+1.
+        masks = []
 
-        if high.sum() < 10:     # ignore high pinput that is too short
-            high *= 0.
+        for idx, threshold in enumerate(thresholds):
+            try:
+                low, high = thresholds[idx:idx + 2]
+            except ValueError:
+                continue
+                low = thresholds[idx:idx + 1]
+                high = None
 
-        return low, high
+            if low is None and high is None:
+                mask = np.where(signal, 1, 0)
+            elif low is None:
+                mask = np.where(signal <= high, 1, 0)
+            elif high is None:
+                mask = np.where(signal >= low, 1, 0)
+            else:
+                mask = np.where(np.logical_and(signal <= high, signal >= low), 1, 0)
+
+            # if mask.sum() < 10:
+            #     mask *= 0.
+
+            masks.append(mask)
+
+        return masks
 
     def to_mask(self, clipped):
-        clipped-=clipped.min()
-        clipped/=clipped.max()
+        clipped -= clipped.min()
+        clipped /= clipped.max()
         return clipped
 
-
     def pid_in(self, pval, gyro, pidp):
-        pidin = gyro + pval / (0.032029 * pidp)       # 0.032029 is P scaling factor from betaflight
+        pidin = gyro + pval / (0.032029 * pidp)  # 0.032029 is P scaling factor from betaflight
         return pidin
 
     def rate_curve(self, rcin, inmax=500., outmax=800., rate=160.):
-        ### an estimated rate curve. not used.
+        #  an estimated rate curve. not used.
         expoin = (np.exp((rcin - inmax) / rate) - np.exp((-rcin - inmax) / rate)) * outmax
         return expoin
 
-
     def calc_delay(self, time, trace1, trace2):
-        ### minimizes trace1-trace2 by shifting trace1
+        #  minimizes trace1-trace2 by shifting trace1
         tf1 = interp1d(time[2000:-2000], trace1[2000:-2000], fill_value=0., bounds_error=False)
         tf2 = interp1d(time[2000:-2000], trace2[2000:-2000], fill_value=0., bounds_error=False)
-        fun = lambda x: ((tf1(time - x*0.5) - tf2(time+ x*0.5)) ** 2).mean()
+
+        def fun(x):
+            return ((tf1(time - x * 0.5) - tf2(time + x * 0.5)) ** 2).mean()
         shift = minimize(fun, np.array([0.01])).x[0]
         steps = np.round(shift / (time[1] - time[0]))
-        return {'time':shift, 'steps':int(steps)}
+        return {'time': shift, 'steps': int(steps)}
 
     def tukeywin(self, len, alpha=0.5):
-        ### makes tukey widow for envelopig
+        #  makes tukey widow for envelopig
         M = len
         n = np.arange(M - 1.)  #
         if alpha <= 0:
@@ -157,71 +255,69 @@ class Trace:
 
     def toy_out(self, inp, delay=0.01, length=0.01, noise=5., mode='normal', sinfreq=100.):
         # generates artificial output for benchmarking
-        freq= 1./(self.time[1]-self.time[0])
-        toyresp = np.zeros(int((delay+length)*freq))
-        toyresp[int((delay)*freq):]=1.
-        toyresp/=toyresp.sum()
-        toyout = np.convolve(inp, toyresp, mode='full')[:len(inp)]#*0.9
-        if mode=='normal':
-            noise_sig = (np.random.random_sample(len(toyout))-0.5)*noise
-        elif mode=='sin':
-            noise_sig = (np.sin(2.*np.pi*self.time*sinfreq)) * noise
+        freq = 1. / (self.time[1] - self.time[0])
+        toyresp = np.zeros(int((delay + length) * freq))
+        toyresp[int((delay) * freq):] = 1.
+        toyresp /= toyresp.sum()
+        toyout = np.convolve(inp, toyresp, mode='full')[:len(inp)]  # *0.9
+        if mode == 'normal':
+            noise_sig = (np.random.random_sample(len(toyout)) - 0.5) * noise
+        elif mode == 'sin':
+            noise_sig = (np.sin(2. * np.pi * self.time * sinfreq)) * noise
         else:
-            noise_sig=0.
-        return toyout+noise_sig
-
+            noise_sig = 0.
+        return toyout + noise_sig
 
     def equalize(self, time, data):
-        ### equalizes time scale
+        # equalizes time scale
         data_f = interp1d(time, data)
         newtime = np.linspace(time[0], time[-1], len(time), dtype=np.float64)
         return newtime, data_f(newtime)
 
     def equalize_data(self):
-        ### equalizes full dict of data
+        # equalizes full dict of data
         time = self.data['time']
         newtime = np.linspace(time[0], time[-1], len(time), dtype=np.float64)
         for key in self.data:
-              if isinstance(self.data[key],np.ndarray):
-                  if len(self.data[key])==len(time):
-                      self.data[key]= interp1d(time, self.data[key])(newtime)
-        self.data['time']=newtime
-
+            if isinstance(self.data[key], np.ndarray):
+                if len(self.data[key]) == len(time):
+                    self.data[key] = interp1d(time, self.data[key])(newtime)
+        self.data['time'] = newtime
 
     def stepcalc(self, time, duration):
-        ### calculates frequency and resulting windowlength
-        tstep = (time[1]-time[0])
-        freq = 1./tstep
+        # calculates frequency and resulting windowlength
+        tstep = (time[1] - time[0])
+        freq = 1. / tstep
         arr_len = duration * freq
         return int(arr_len)
 
     def winstacker(self, stackdict, flen, superpos):
-        ### makes stack of windows for deconvolution
+        # makes stack of windows for deconvolution
         tlen = len(self.data['time'])
-        shift = int(flen/superpos)
-        wins = int(tlen/shift)-superpos
+        shift = int(flen / superpos)
+        wins = int(tlen / shift) - superpos
         for i in np.arange(wins):
             for key in stackdict.keys():
                 stackdict[key].append(self.data[key][i * shift:i * shift + flen])
         for k in stackdict.keys():
-            #print 'key',k
-            #print stackdict[k]
-            stackdict[k]=np.array(stackdict[k], dtype=np.float64)
+            #  print 'key',k
+            #  print stackdict[k]
+            stackdict[k] = np.array(stackdict[k], dtype=np.float64)
         return stackdict
 
-    def wiener_deconvolution(self, input, output, cutfreq):      # input/output are two-dimensional
-        pad = 1024 - (len(input[0]) % 1024)                     # padding to power of 2, increases transform speed
-        input = np.pad(input, [[0,0],[0,pad]], mode='constant')
+    def wiener_deconvolution(self, input, output, cutfreq):  # input/output are two-dimensional
+        pad = 1024 - (len(input[0]) % 1024)  # padding to power of 2, increases transform speed
+        input = np.pad(input, [[0, 0], [0, pad]], mode='constant')
         output = np.pad(output, [[0, 0], [0, pad]], mode='constant')
         H = np.fft.fft(input, axis=-1)
-        G = np.fft.fft(output,axis=-1)
+        G = np.fft.fft(output, axis=-1)
         freq = np.abs(np.fft.fftfreq(len(input[0]), self.dt))
-        sn = self.to_mask(np.clip(np.abs(freq), cutfreq-1e-9, cutfreq))
-        len_lpf=np.sum(np.ones_like(sn)-sn)
-        sn=self.to_mask(gaussian_filter1d(sn,len_lpf/6.))
-        sn= 10.*(-sn+1.+1e-9)       # +1e-9 to prohibit 0/0 situations
+        sn = self.to_mask(np.clip(np.abs(freq), cutfreq - 1e-9, cutfreq))
+        len_lpf = np.sum(np.ones_like(sn) - sn)
+        sn = self.to_mask(gaussian_filter1d(sn, len_lpf / 6.))
+        sn = 10. * (-sn + 1. + 1e-9)  # +1e-9 to prohibit 0/0 situations
         Hcon = np.conj(H)
-        deconvolved_sm = np.real(np.fft.ifft(G * Hcon / (H * Hcon + 1./sn),axis=-1))
+        deconvolved_sm = np.real(np.fft.ifft(G * Hcon / (H * Hcon + 1. / sn), axis=-1))
         return deconvolved_sm
 
     def stack_response(self, stacks, window):
@@ -240,7 +336,7 @@ class Trace:
         return delta_resp, avr_t, avr_in, max_in, max_thr
 
     def spectrum(self, time, traces):
-        ### fouriertransform for noise analysis. returns frequencies and spectrum.
+        # fouriertransform for noise analysis. returns frequencies and spectrum.
         pad = 1024 - (len(traces[0]) % 1024)  # padding to power of 2, increases transform speed
         traces = np.pad(traces, [[0, 0], [0, pad]], mode='constant')
         trspec = np.fft.rfft(traces, axis=-1, norm='ortho')
@@ -248,9 +344,9 @@ class Trace:
         return trfreq, trspec
 
     def stackfilter(self, time, trace_ref, trace_filt, window):
-        ### calculates filter transmission and phaseshift from stack of windows. Not in use, maybe later.
+        # calculates filter transmission and phaseshift from stack of windows. Not in use, maybe later.
         # slicing off last 2s to get rid of landing
-        #maybe pass throttle for further analysis...
+        # maybe pass throttle for further analysis...
         filt = trace_filt[:-int(Trace.noise_superpos * 2. / Trace.noise_framelen), :] * window
         ref = trace_ref[:-int(Trace.noise_superpos * 2. / Trace.noise_framelen), :] * window
         time = time[:-int(Trace.noise_superpos * 2. / Trace.noise_framelen), :]
@@ -258,12 +354,17 @@ class Trace:
         full_freq_f, full_spec_f = self.spectrum(self.data['time'], [self.data['gyro']])
         full_freq_r, full_spec_r = self.spectrum(self.data['time'], [self.data['debug']])
 
-        f_amp_freq, f_amp_hist =np.histogram(full_freq_f, weights=np.abs(full_spec_f.real).flatten(), bins=int(full_freq_f[-1]))
-        r_amp_freq, r_amp_hist = np.histogram(full_freq_r, weights=np.abs(full_spec_r.real).flatten(), bins=int(full_freq_r[-1]))
+        f_amp_freq, f_amp_hist = np.histogram(full_freq_f,
+                                              weights=np.abs(full_spec_f.real).flatten(),
+                                              bins=int(full_freq_f[-1]))
+        r_amp_freq, r_amp_hist = np.histogram(full_freq_r,
+                                              weights=np.abs(full_spec_r.real).flatten(),
+                                              bins=int(full_freq_r[-1]))
 
-    def hist2d(self, x, y, weights, bins):   #bins[nx,ny]
-        ### generates a 2d hist from input 1d axis for x,y. repeats them to match shape of weights X*Y (data points)
-        ### x will be 0-100%
+    def hist2d(self, x, y, weights, bins):  # bins[nx,ny]
+        # generates a 2d hist from input 1d axis for x,y. repeats them to match shape
+        # of weights X*Y (data points)
+        # x will be 0-100%
         freqs = np.repeat(np.array([y], dtype=np.float64), len(x), axis=0)
         throts = np.repeat(np.array([x], dtype=np.float64), len(y), axis=0).transpose()
         throt_hist_avr, throt_scale_avr = np.histogram(x, 101, [0, 100])
@@ -274,56 +375,65 @@ class Trace:
 
         hist2d = np.array(abs(hist2d), dtype=np.float64)
         hist2d_norm = np.copy(hist2d)
-        hist2d_norm /=  (throt_hist_avr + 1e-9)
+        hist2d_norm /= (throt_hist_avr + 1e-9)
 
-        return {'hist2d_norm':hist2d_norm, 'hist2d':hist2d, 'throt_hist':throt_hist_avr,'throt_scale':throt_scale_avr}
-
+        return {'hist2d_norm': hist2d_norm,
+                'hist2d': hist2d,
+                'throt_hist': throt_hist_avr,
+                'throt_scale': throt_scale_avr}
 
     def stackspectrum(self, time, throttle, trace, window):
-        ### calculates spectrogram from stack of windows against throttle.
+        # calculates spectrogram from stack of windows against throttle.
         # slicing off last 2s to get rid of landing
-        gyro = trace[:-int(Trace.noise_superpos*2./Trace.noise_framelen),:] * window
-        thr = throttle[:-int(Trace.noise_superpos*2./Trace.noise_framelen),:] * window
-        time = time[:-int(Trace.noise_superpos*2./Trace.noise_framelen),:]
+        gyro = trace[:-int(Trace.noise_superpos * 2. / Trace.noise_framelen), :] * window
+        thr = throttle[:-int(Trace.noise_superpos * 2. / Trace.noise_framelen), :] * window
+        time = time[:-int(Trace.noise_superpos * 2. / Trace.noise_framelen), :]
 
         freq, spec = self.spectrum(time[0], gyro)
 
         weights = abs(spec.real)
         avr_thr = np.abs(thr).max(axis=1)
 
-        hist2d=self.hist2d(avr_thr, freq,weights,[101,len(freq)/4])
+        hist2d = self.hist2d(avr_thr, freq, weights, [101, len(freq) / 4])
 
         filt_width = 3  # width of gaussian smoothing for hist data
         hist2d_sm = gaussian_filter1d(hist2d['hist2d_norm'], filt_width, axis=1, mode='constant')
 
         # get max value in histogram >100hz
         thresh = 100.
-        mask = self.to_mask(freq[:-1:4].clip(thresh-1e-9,thresh))
-        maxval = np.max(hist2d_sm.transpose()*mask)
+        mask = self.to_mask(freq[:-1:4].clip(thresh - 1e-9, thresh))
+        maxval = np.max(hist2d_sm.transpose() * mask)
+        maxval = 100
 
-        return {'throt_hist_avr':hist2d['throt_hist'],'throt_axis':hist2d['throt_scale'],'freq_axis':freq[::4],
-                'hist2d_norm':hist2d['hist2d_norm'], 'hist2d_sm':hist2d_sm, 'hist2d':hist2d['hist2d'], 'max':maxval}
+        return {'throt_hist_avr': hist2d['throt_hist'],
+                'throt_axis': hist2d['throt_scale'],
+                'freq_axis': freq[::4],
+                'hist2d_norm': hist2d['hist2d_norm'],
+                'hist2d_sm': hist2d_sm,
+                'hist2d': hist2d['hist2d'],
+                'max': maxval}
 
     def weighted_mode_avr(self, values, weights, vertrange, vertbins):
-        ### finds the most common trace and std
+        # finds the most common trace and std
         threshold = 0.5  # threshold for std calculation
         filt_width = 7  # width of gaussian smoothing for hist data
 
         resp_y = np.linspace(vertrange[0], vertrange[-1], vertbins, dtype=np.float64)
-        times = np.repeat(np.array([self.time_resp],dtype=np.float64), len(values), axis=0)
+        times = np.repeat(np.array([self.time_resp], dtype=np.float64), len(values), axis=0)
         weights = np.repeat(weights, len(values[0]))
 
         hist2d = np.histogram2d(times.flatten(), values.flatten(),
                                 range=[[self.time_resp[0], self.time_resp[-1]], vertrange],
                                 bins=[len(times[0]), vertbins], weights=weights.flatten())[0].transpose()
-        ### shift outer edges by +-1e-5 (10us) bacause of dtype32. Otherwise different precisions lead to artefacting.
-        ### solution to this --> somethings strage here. In outer most edges some bins are doubled, some are empty.
-        ### Hence sometimes produces "divide by 0 error" in "/=" operation.
+        # shift outer edges by +-1e-5 (10us) bacause of dtype32. Otherwise different
+        # precisions lead to artefacting.
+        # solution to this --> somethings strage here. In outer most edges some bins
+        # are doubled, some are empty.
+        # Hence sometimes produces "divide by 0 error" in "/=" operation.
 
         if hist2d.sum():
             hist2d_sm = gaussian_filter1d(hist2d, filt_width, axis=0, mode='constant')
             hist2d_sm /= np.max(hist2d_sm, 0)
-
 
             pixelpos = np.repeat(resp_y.reshape(len(resp_y), 1), len(times[0]), axis=1)
             avr = np.average(pixelpos, 0, weights=hist2d_sm * hist2d_sm)
@@ -338,15 +448,16 @@ class Trace:
 
         return avr, std, [self.time_resp, resp_y, hist2d_sm]
 
-    ### calculates weighted avverage and resulting errors
+    # calculates weighted avverage and resulting errors
     def weighted_avg_and_std(self, values, weights):
         average = np.average(values, axis=0, weights=weights)
         variance = np.average((values - average) ** 2, axis=0, weights=weights)
         return (average, np.sqrt(variance))
 
+
 class CSV_log:
 
-    def __init__(self, fpath, name, headdict, noise_bounds):
+    def __init__(self, fpath, name, headdict, noise_bounds, response_compare, keep):
         self.file = fpath
         self.name = name
         self.headdict = headdict
@@ -354,76 +465,101 @@ class CSV_log:
         self.data = self.readcsv(self.file)
 
         logging.info('Processing:')
+        self.response_compare = response_compare
+        self.keep = keep
         self.traces = self.find_traces(self.data)
         self.roll, self.pitch, self.yaw = self.__analyze()
         self.fig_resp = self.plot_all_resp([self.roll, self.pitch, self.yaw])
-        self.fig_noise = self.plot_all_noise([self.roll, self.pitch, self.yaw],noise_bounds)
+        self.fig_noise = self.plot_all_noise([self.roll, self.pitch, self.yaw], noise_bounds)
 
-    def check_lims_list(self,lims):
+    def check_lims_list(self, lims):
+        return True
         if type(lims) is list:
-            l=np.array(lims)
-            if str(np.shape(l))=='(4L, 2L)':
-                ll=l[:,1]-l[:,0]
-                if np.sum(np.abs((ll-np.abs(ll))))==0:
+            npl = np.array(lims)
+            if str(np.shape(npl)) == '(4L, 2L)':
+                ll = npl[:, 1] - npl[:, 0]
+                if np.sum(np.abs((ll - np.abs(ll)))) == 0:
                     return True
         else:
             logging.info('noise_bounds is no valid list')
             return False
 
-    def plot_all_noise(self, traces, lims): #style='fancy' gives 2d hist for response
+    def plot_all_noise(self, traces, lims):  # style='fancy' gives 2d hist for response
         textsize = 7
         rcParams.update({'font.size': 9})
 
         logging.info('Making noise plot...')
-        fig = plt.figure('Noise plot: Log number: ' + self.headdict['logNum']+'          '+self.file , figsize=(16, 8))
-        ### gridspec devides window into 25 horizontal, 31 vertical fields
-        gs1 = GridSpec(25, 3 * 10+2, wspace=0.6, hspace=0.7, left=0.04, right=1., bottom=0.05, top=0.97)
+        fig = plt.figure('Noise plot: Log number: %s          %s' % (self.headdict['logNum'],
+                                                                     self.file),
+                         figsize=(16, 8))
+        # gridspec devides window into 25 horizontal, 31 vertical fields
+        gs1 = GridSpec(25, 3 * 10 + 2,
+                       wspace=0.6,
+                       hspace=0.7,
+                       left=0.04,
+                       right=1.,
+                       bottom=0.05,
+                       top=0.97)
 
-        max_noise_gyro = np.max([traces[0].noise_gyro['max'],traces[1].noise_gyro['max'],traces[2].noise_gyro['max']])+1.
-        max_noise_debug = np.max([traces[0].noise_debug['max'], traces[1].noise_debug['max'], traces[2].noise_debug['max']])+1.
-        max_noise_d = np.max([traces[0].noise_d['max'], traces[1].noise_d['max'], traces[2].noise_d['max']])+1.
+        max_noise_gyro = np.max([traces[0].noise_gyro['max'],
+                                 traces[1].noise_gyro['max'],
+                                 traces[2].noise_gyro['max']]) + 1.
+        max_noise_debug = np.max([traces[0].noise_debug['max'],
+                                  traces[1].noise_debug['max'],
+                                  traces[2].noise_debug['max']]) + 1.
+        max_noise_d = np.max([traces[0].noise_d['max'],
+                              traces[1].noise_d['max'],
+                              traces[2].noise_d['max']]) + 1.
 
         meanspec = np.array([traces[0].noise_gyro['hist2d_sm'].mean(axis=1).flatten(),
-                    traces[1].noise_gyro['hist2d_sm'].mean(axis=1).flatten(),
-                    traces[2].noise_gyro['hist2d_sm'].mean(axis=1).flatten()],dtype=np.float64)
+                             traces[1].noise_gyro['hist2d_sm'].mean(axis=1).flatten(),
+                             traces[2].noise_gyro['hist2d_sm'].mean(axis=1).flatten()],
+                            dtype=np.float64)
         thresh = 100.
-        mask = traces[0].to_mask(traces[0].noise_gyro['freq_axis'].clip(thresh-1e-9,thresh))
-        meanspec_max = np.max(meanspec*mask[:-1])
+        mask = traces[0].to_mask(traces[0].noise_gyro['freq_axis'].clip(thresh - 1e-9, thresh))
+        meanspec_max = np.max(meanspec * mask[:-1])
 
         if not self.check_lims_list(lims):
-            lims=np.array([[1,max_noise_gyro],[1, max_noise_debug], [1, max_noise_d], [0,meanspec_max*1.5]])
-            if lims[0,1] == 1:
-                lims[0,1]=100.
+            lims = np.array([[1, max_noise_gyro],
+                             [1, max_noise_debug],
+                             [1, max_noise_d],
+                             [0, meanspec_max * 1.5]])
+            if lims[0, 1] == 1:
+                lims[0, 1] = 100.
             if lims[1, 1] == 1:
-                lims[1, 1]=100.
+                lims[1, 1] = 100.
             if lims[2, 1] == 1:
-                lims[2, 1]=100.
+                lims[2, 1] = 100.
         else:
-            lims=np.array(lims)
+            lims = np.array(lims)
 
         cax_gyro = plt.subplot(gs1[0, 0:7])
         cax_debug = plt.subplot(gs1[0, 8:15])
         cax_d = plt.subplot(gs1[0, 16:23])
-        cmap='viridis'
+        cmap = 'viridis'
 
         axes_gyro = []
         axes_debug = []
         axes_d = []
         axes_trans = []
 
-
         for i, tr in enumerate(traces):
-            if tr.noise_gyro['freq_axis'][-1]>1000:
-                pltlim = [0,1000]
+            if tr.noise_gyro['freq_axis'][-1] > 1000:
+                pltlim = [0, 1000]
             else:
-                pltlim = [tr.noise_gyro['freq_axis'][-0],tr.noise_gyro['freq_axis'][-1]]
+                pltlim = [tr.noise_gyro['freq_axis'][-0], tr.noise_gyro['freq_axis'][-1]]
             # gyro plots
-            ax0 = plt.subplot(gs1[1+i*8:1+i*8+8 , 0:7])
+            ax0 = plt.subplot(gs1[1 + i * 8:1 + i * 8 + 8, 0:7])
             if len(axes_gyro):
                 axes_gyro[0].get_shared_x_axes().join(axes_gyro[0], ax0)
             axes_gyro.append(ax0)
-            ax0.set_title('gyro '+tr.name, y=0.88, color='w')
-            pc0 = plt.pcolormesh(tr.noise_gyro['throt_axis'], tr.noise_gyro['freq_axis'], tr.noise_gyro['hist2d_sm']+1.,norm=colors.LogNorm(vmin=lims[0,0],vmax=lims[0,1]),cmap=cmap)
+            ax0.set_title('gyro ' + tr.name, y=0.88, color='w')
+            pc0 = plt.pcolormesh(tr.noise_gyro['throt_axis'],
+                                 tr.noise_gyro['freq_axis'],
+                                 tr.noise_gyro['hist2d_sm'] + 1.,
+                                 norm=colors.LogNorm(vmin=lims[0],
+                                                     vmax=lims[1]),
+                                 cmap=cmap)
             ax0.set_ylabel('frequency in Hz')
             ax0.grid()
             ax0.set_ylim(pltlim)
@@ -442,16 +578,20 @@ class CSV_log:
                          transform=ax0.transAxes, fontdict={'color': 'white'})
 
             # debug plots
-            ax1 = plt.subplot(gs1[1+i*8:1+i*8+8 , 8:15])
+            ax1 = plt.subplot(gs1[1 + i * 8:1 + i * 8 + 8, 8:15])
             if len(axes_debug):
                 axes_debug[0].get_shared_x_axes().join(axes_debug[0], ax1)
             axes_debug.append(ax1)
             ax1.set_title('debug ' + tr.name, y=0.88, color='w')
-            pc1 = plt.pcolormesh(tr.noise_debug['throt_axis'],tr.noise_debug['freq_axis'], tr.noise_debug['hist2d_sm']+1., norm=colors.LogNorm(vmin=lims[1,0],vmax=lims[1,1]),cmap=cmap)
+            pc1 = plt.pcolormesh(tr.noise_debug['throt_axis'],
+                                 tr.noise_debug['freq_axis'],
+                                 tr.noise_debug['hist2d_sm'] + 1.,
+                                 norm=colors.LogNorm(vmin=lims[2], vmax=lims[3]),
+                                 cmap=cmap)
             ax1.set_ylabel('frequency in Hz')
             ax1.grid()
             ax1.set_ylim(pltlim)
-            if i<2:
+            if i < 2:
                 plt.setp(ax1.get_xticklabels(), visible=False)
             else:
                 ax1.set_xlabel('throttle in %')
@@ -460,21 +600,29 @@ class CSV_log:
             cax_debug.xaxis.set_ticks_position('top')
             cax_debug.xaxis.set_tick_params(pad=-0.5)
 
-            if max_noise_debug==1.:
-                ax1.text(0.5, 0.5, 'no debug['+str(i)+'] trace found!\n'
-                                                      'To get transmission of\n'
-                                                      '- all filters: set debug_mode = NOTCH\n'
-                                                      '- LPF only: set debug_mode = GYRO', horizontalalignment='center', verticalalignment = 'center',
-                                                      transform = ax1.transAxes,fontdict={'color': 'white'})
+            if max_noise_debug == 1.:
+                ax1.text(0.5, 0.5,
+                         ('no debug[' + str(i) + '] trace found!\n'
+                          'To get transmission of\n'
+                          '- all filters: set debug_mode = NOTCH\n'
+                          '- LPF only: set debug_mode = GYRO'),
+                         horizontalalignment='center',
+                         verticalalignment='center',
+                         transform=ax1.transAxes,
+                         fontdict={'color': 'white'})
 
-            if i<2:
+            if i < 2:
                 # dterm plots
                 ax2 = plt.subplot(gs1[1 + i * 8:1 + i * 8 + 8, 16:23])
                 if len(axes_d):
                     axes_d[0].get_shared_x_axes().join(axes_d[0], ax2)
                 axes_d.append(ax2)
                 ax2.set_title('D-term ' + tr.name, y=0.88, color='w')
-                pc2 = plt.pcolormesh(tr.noise_d['throt_axis'], tr.noise_d['freq_axis'], tr.noise_d['hist2d_sm']+1., norm=colors.LogNorm(vmin=lims[2,0],vmax=lims[2,1]),cmap=cmap)
+                pc2 = plt.pcolormesh(tr.noise_d['throt_axis'],
+                                     tr.noise_d['freq_axis'],
+                                     tr.noise_d['hist2d_sm'] + 1.,
+                                     norm=colors.LogNorm(vmin=lims[4], vmax=lims[5]),
+                                     cmap=cmap)
                 ax2.set_ylabel('frequency in Hz')
                 ax2.grid()
                 ax2.set_ylim(pltlim)
@@ -489,107 +637,158 @@ class CSV_log:
                              horizontalalignment='center', verticalalignment='center',
                              transform=ax2.transAxes, fontdict={'color': 'white'})
 
-
             else:
                 # throttle plots
                 ax21 = plt.subplot(gs1[1 + i * 8:1 + i * 8 + 4, 16:23])
                 ax22 = plt.subplot(gs1[1 + i * 8 + 5:1 + i * 8 + 8, 16:23])
-                ax21.bar(tr.throt_scale[:-1], tr.throt_hist*100., width=1.,align='edge', color='black', alpha=0.2, label='throttle distribution')
+                ax21.bar(tr.throt_scale[:-1],
+                         tr.throt_hist * 100.,
+                         width=1.,
+                         align='edge',
+                         color='black',
+                         alpha=0.2,
+                         label='throttle distribution')
                 axes_d[0].get_shared_x_axes().join(axes_d[0], ax21)
                 ax21.vlines(self.headdict['tpa_percent'], 0., 100., label='tpa', colors='red', alpha=0.5)
                 ax21.grid()
                 ax21.set_ylim([0., np.max(tr.throt_hist) * 100. * 1.1])
                 ax21.set_xlabel('throttle in %')
                 ax21.set_ylabel('usage %')
-                ax21.set_xlim([0.,100.])
+                ax21.set_xlim([0., 100.])
                 handles, labels = ax21.get_legend_handles_labels()
                 ax21.legend(handles[::-1], labels[::-1])
-                ax22.fill_between(tr.time, 0., tr.throttle, label='throttle input', facecolors='black', alpha=0.2)
-                ax22.hlines(self.headdict['tpa_percent'],tr.time[0], tr.time[-1], label='tpa', colors='red', alpha=0.5)
+                ax22.fill_between(tr.time,
+                                  0.,
+                                  tr.throttle,
+                                  label='throttle input',
+                                  facecolors='black',
+                                  alpha=0.2)
+                ax22.hlines(self.headdict['tpa_percent'],
+                            tr.time[0],
+                            tr.time[-1],
+                            label='tpa',
+                            colors='red',
+                            alpha=0.5)
 
                 ax22.set_ylabel('throttle in %')
                 ax22.legend()
                 ax22.grid()
-                ax22.set_ylim([0.,100.])
-                ax22.set_xlim([tr.time[0],tr.time[-1]])
+                ax22.set_ylim([0., 100.])
+                ax22.set_xlim([tr.time[0], tr.time[-1]])
                 ax22.set_xlabel('time in s')
 
             # transmission plots
-            ax3 = plt.subplot(gs1[1+i*8:1+i*8+8 , 24:30])
+            ax3 = plt.subplot(gs1[1 + i * 8:1 + i * 8 + 8, 24:30])
             if len(axes_trans):
                 axes_trans[0].get_shared_x_axes().join(axes_trans[0], ax3)
             axes_trans.append(ax3)
-            ax3.fill_between(tr.noise_gyro['freq_axis'][:-1], 0, meanspec[i], label=tr.name + ' gyro noise', alpha=0.2)
-            ax3.set_ylim(lims[3])
-            ax3.set_ylabel(tr.name+' gyro noise a.u.')
+            ax3.fill_between(tr.noise_gyro['freq_axis'][:-1],
+                             0,
+                             meanspec[i],
+                             label=tr.name + ' gyro noise',
+                             alpha=0.2)
+            ax3.set_ylim(lims[6], lims[7])
+            ax3.set_ylabel(tr.name + ' gyro noise a.u.')
             ax3.grid()
             ax3r = plt.twinx(ax3)
-            ax3r.plot(tr.noise_gyro['freq_axis'][:-1], tr.filter_trans*100., label=tr.name + ' filter transmission')
+            ax3r.plot(tr.noise_gyro['freq_axis'][:-1],
+                      tr.filter_trans * 100.,
+                      label=tr.name + ' filter transmission')
             ax3r.set_ylabel('transmission in %')
             ax3r.set_ylim([0., 100.])
-            ax3r.set_xlim([tr.noise_gyro['freq_axis'][0],tr.noise_gyro['freq_axis'][-2]])
+            ax3r.set_xlim([tr.noise_gyro['freq_axis'][0],
+                           tr.noise_gyro['freq_axis'][-2]])
             lines, labels = ax3.get_legend_handles_labels()
             lines2, labels2 = ax3r.get_legend_handles_labels()
-            ax3r.legend(lines+lines2, labels+labels2, loc=1)
+            ax3r.legend(lines + lines2, labels + labels2, loc=1)
             if i < 2:
                 plt.setp(ax3.get_xticklabels(), visible=False)
             else:
                 ax3.set_xlabel('frequency in hz')
 
-        meanfreq = 1./(traces[0].time[1]-traces[0].time[0])
+        meanfreq = 1. / (traces[0].time[1] - traces[0].time[0])
         ax4 = plt.subplot(gs1[12, -1])
-        t = Version+"| Betaflight: Version "+self.headdict['version']+' | Craftname: '+self.headdict['craftName']+\
-            ' | meanFreq: '+str(int(meanfreq))+' | rcRate/Expo: '+self.headdict['rcRate']+'/'+ self.headdict['rcExpo']+'\nrcYawRate/Expo: '+self.headdict['rcYawRate']+'/' \
-            +self.headdict['rcYawExpo']+' | deadBand: '+self.headdict['deadBand']+' | yawDeadBand: '+self.headdict['yawDeadBand'] \
-            +' | Throttle min/tpa/max: ' + self.headdict['minThrottle']+'/'+self.headdict['tpa_breakpoint']+'/'+self.headdict['maxThrottle'] \
-            + ' | dynThrPID: ' + self.headdict['dynThrottle']+ '| D-TermSP: ' + self.headdict['dTermSetPoint']+'| vbatComp: ' + self.headdict['vbatComp']+' | debug '+ self.headdict['debug_mode']
 
-        ax4.text(0, 0, t, ha='left', va='center', rotation=90, color='grey', alpha=0.5, fontsize=textsize)
+        headdict = self.headdict
+        t = Version
+        t += "| Betaflight: Version %s " % headdict['version']
+        t += '| Craftname: %s ' % headdict['craftName']
+        t += '| meanFreq: %s ' % str(int(meanfreq))
+        t += '| rcRate/Expo: %s/%s ' % (headdict['rcRate'], headdict['rcExpo'])
+        t += '\n'
+        t += 'rcYawRate/Expo: %s/%s ' % (headdict['rcYawRate'], headdict['rcYawExpo'])
+        t += 'deadBand: %s ' % headdict['deadBand']
+        t += ' | yawDeadBand: %s ' % headdict['yawDeadBand']
+        t += ' | Throttle min/tpa/max: %s/%s/%s ' % (headdict['minThrottle'],
+                                                     headdict['tpa_breakpoint'],
+                                                     headdict['maxThrottle'])
+        t += ' | dynThrPID: %s' % headdict['dynThrottle']
+        t += ' | D-TermSP: %s' % headdict['dTermSetPoint']
+        t += ' | vbatComp: %s' % headdict['vbatComp']
+        t += ' | debug %s' % headdict['debug_mode']
+
+        ax4.text(0, 0, t,
+                 ha='left',
+                 va='center',
+                 rotation=90,
+                 color='grey',
+                 alpha=0.5,
+                 fontsize=textsize)
         ax4.axis('off')
 
         ax5l = plt.subplot(gs1[:1, 24:27])
         ax5r = plt.subplot(gs1[:1, 27:30])
         ax5l.axis('off')
         ax5r.axis('off')
-        filt_settings_l = 'G lpf type: '+self.headdict['gyro_lpf']+' at '+self.headdict['gyro_lowpass_hz']+'\n'+\
-                          'G notch at: '+self.headdict['gyro_notch_hz']+' cut '+self.headdict['gyro_notch_cutoff']+'\n'\
-                          'gyro lpf 2: '+self.headdict['gyro_lowpass_type']
-        filt_settings_r = '| D lpf type: ' + self.headdict['dterm_filter_type'] + ' at ' + self.headdict['dterm_lpf_hz'] + '\n' + \
-                          '| D notch at: ' + self.headdict['dterm_notch_hz'] + ' cut ' + self.headdict['dterm_notch_cutoff'] + '\n' + \
-                          '| Yaw lpf at: ' + self.headdict['yaw_lpf_hz']
+        filt_settings_l = '\n'.join([
+            'G lpf type: %s at %s' % (headdict['gyro_lpf'], headdict['gyro_lowpass_hz']),
+            'G notch at: %s cut %s' % (headdict['gyro_notch_hz'], headdict['gyro_notch_cutoff']),
+            'gyro lpf 2: %s' % headdict['gyro_lowpass_type']])
+        filt_settings_r = '\n'.join([
+            '| D lpf type: %s at %s' % (headdict['dterm_filter_type'], headdict['dterm_lpf_hz']),
+            '| D notch at: %s cut %s' % (headdict['dterm_notch_hz'], headdict['dterm_notch_cutoff']),
+            '| Yaw lpf at: %s' % headdict['yaw_lpf_hz']])
 
         ax5l.text(0, 0, filt_settings_l, ha='left', fontsize=textsize)
         ax5r.text(0, 0, filt_settings_r, ha='left', fontsize=textsize)
 
         logging.info('Saving as image...')
-        plt.savefig(self.file[:-13] + self.name + '_' + str(self.headdict['logNum'])+'_noise.png')
+        plt.savefig("%s%s_%s_noise.png" % (self.file[:-13],
+                                           self.name,
+                                           str(self.headdict['logNum'])))
         return fig
 
-
-    def plot_all_resp(self, traces, style='ra'): # style='raw' for response vs. time in color plot
+    def plot_all_resp(self, traces, style='ra'):  # style='raw' for response vs. time in color plot
         textsize = 7
         titelsize = 10
         rcParams.update({'font.size': 9})
         logging.info('Making PID plot...')
-        fig = plt.figure('Response plot: Log number: ' + self.headdict['logNum']+'          '+self.file , figsize=(16, 8))
-        ### gridspec devides window into 24 horizontal, 3*10 vertical fields
+        fig = plt.figure('Response plot: Log number: %s          %s' % (
+                         self.headdict['logNum'], self.file),
+                         figsize=(16, 8))
+        # gridspec devides window into 24 horizontal, 3*10 vertical fields
         gs1 = GridSpec(24, 3 * 10, wspace=0.6, hspace=0.7, left=0.04, right=1., bottom=0.05, top=0.97)
 
         for i, tr in enumerate(traces):
-            ax0 = plt.subplot(gs1[0:6, i*10:i*10+9])
+            ax0 = plt.subplot(gs1[0:6, i * 10: i * 10 + 9])
             plt.title(tr.name)
             plt.plot(tr.time, tr.gyro, label=tr.name + ' gyro')
             plt.plot(tr.time, tr.input, label=tr.name + ' loop input')
             plt.ylabel('degrees/second')
             ax0.get_yaxis().set_label_coords(-0.1, 0.5)
             plt.grid()
-            tracelim = np.max([np.abs(tr.gyro),np.abs(tr.input)])
-            plt.ylim([-tracelim*1.1, tracelim*1.1])
+            tracelim = np.max([np.abs(tr.gyro), np.abs(tr.input)])
+            plt.ylim([-tracelim * 1.1, tracelim * 1.1])
             plt.legend(loc=1)
             plt.setp(ax0.get_xticklabels(), visible=False)
 
-            ax1 = plt.subplot(gs1[6:8, i*10:i*10+9], sharex=ax0)
-            plt.hlines(self.headdict['tpa_percent'], tr.time[0], tr.time[-1], label='tpa', colors='red', alpha=0.5)
+            ax1 = plt.subplot(gs1[6:8, i * 10: i * 10 + 9], sharex=ax0)
+            plt.hlines(self.headdict['tpa_percent'],
+                       tr.time[0],
+                       tr.time[-1],
+                       label='tpa',
+                       colors='red',
+                       alpha=0.5)
             plt.fill_between(tr.time, 0., tr.throttle, label='throttle', color='grey', alpha=0.2)
             plt.ylabel('throttle %')
             ax1.get_yaxis().set_label_coords(-0.1, 0.5)
@@ -599,10 +798,10 @@ class CSV_log:
             plt.legend(loc=1)
             plt.xlabel('log time in s')
 
-            if style =='raw':
-                ###old raw data plot.
+            if style == 'raw':
+                # old raw data plot.
                 plt.setp(ax1.get_xticklabels(), visible=False)
-                ax2 = plt.subplot(gs1[9:16, i*10:i*10+9], sharex=ax0)
+                ax2 = plt.subplot(gs1[9:16, i * 10:i * 10 + 9], sharex=ax0)
                 plt.pcolormesh(tr.avr_t, tr.time_resp, np.transpose(tr.spec_sm), vmin=0, vmax=2.)
                 plt.ylabel('response time in s')
                 ax2.get_yaxis().set_label_coords(-0.1, 0.5)
@@ -610,38 +809,49 @@ class CSV_log:
                 plt.xlim([tr.avr_t[0], tr.avr_t[-1]])
 
             else:
-                ###response vs throttle plot. more useful.
+                # response vs throttle plot. more useful.
                 ax2 = plt.subplot(gs1[9:16, i * 10:i * 10 + 9])
                 plt.title(tr.name + ' response', y=0.88, color='w')
-                plt.pcolormesh(tr.thr_response['throt_scale'], tr.time_resp, tr.thr_response['hist2d_norm'], vmin=0., vmax=2.)
+                plt.pcolormesh(tr.thr_response['throt_scale'],
+                               tr.time_resp,
+                               tr.thr_response['hist2d_norm'],
+                               vmin=0.,
+                               vmax=2.)
                 plt.ylabel('response time in s')
                 ax2.get_yaxis().set_label_coords(-0.1, 0.5)
                 plt.xlabel('throttle in %')
-                plt.xlim([0.,100.])
+                plt.xlim([0., 100.])
 
-
-            theCM = plt.cm.get_cmap('Blues')
-            theCM._init()
-            alphas = np.abs(np.linspace(0., 0.5, theCM.N, dtype=np.float64))
-            theCM._lut[:-3,-1] = alphas
-            ax3 = plt.subplot(gs1[17:, i*10:i*10+9])
-            plt.contourf(*tr.resp_low[2], cmap=theCM, linestyles=None, antialiased=True, levels=np.linspace(0,1,20, dtype=np.float64))
-            plt.plot(tr.time_resp, tr.resp_low[0],
-                     label=tr.name + ' step response ' + '(<' + str(int(Trace.threshold)) + ') '
-                           + ' PID ' + self.headdict[tr.name + 'PID'])
-
-
-            if tr.high_mask.sum() > 0:
-                theCM = plt.cm.get_cmap('Oranges')
+            colors = ['Blues', 'Reds', 'Greens', 'Purples', 'Oranges']
+            ax3 = plt.subplot(gs1[17:, i * 10: i * 10 + 9])
+            print_pids_once = False
+            for idx, response in enumerate(tr.responses):
+                theCM = plt.cm.get_cmap(colors.pop(0))
                 theCM._init()
                 alphas = np.abs(np.linspace(0., 0.5, theCM.N, dtype=np.float64))
-                theCM._lut[:-3,-1] = alphas
-                plt.contourf(*tr.resp_high[2], cmap=theCM, linestyles=None, antialiased=True, levels=np.linspace(0,1,20, dtype=np.float64))
-                plt.plot(tr.time_resp, tr.resp_high[0],
-                     label=tr.name + ' step response ' + '(>' + str(int(Trace.threshold)) + ') '
-                           + ' PID ' + self.headdict[tr.name + 'PID'])
-            plt.xlim([-0.001,0.501])
+                theCM._lut[:-3, -1] = alphas
+                plt.contourf(*response[2],
+                             cmap=theCM,
+                             linestyles=None,
+                             antialiased=True,
+                             levels=np.linspace(0, 1, 20, dtype=np.float64))
+                label = '%s %s' % (tr.name, tr.response_labels[idx])
 
+                if not print_pids_once:
+                    label += " PID %s" % self.headdict[tr.name + 'PID']
+                    print_pids_once = True
+                plt.plot(tr.time_resp, response[0], label=label)
+                continue
+                plt.plot(tr.time_resp, response[0],
+                         label=''.join([tr.name,
+                                        ' step response ',
+                                        '(<',
+                                        str(int(Trace.threshold)),
+                                        ') ',
+                                        ' PID ',
+                                        self.headdict[tr.name + 'PID']]))
+
+            plt.xlim([-0.001, 0.501])
 
             plt.legend(loc=1)
             plt.ylim([0., 2])
@@ -651,88 +861,125 @@ class CSV_log:
 
             plt.grid()
 
-        meanfreq = 1./(traces[0].time[1]-traces[0].time[0])
+        meanfreq = 1. / (traces[0].time[1] - traces[0].time[0])
         ax4 = plt.subplot(gs1[12, -1])
-        t = Version+" | Betaflight: Version "+self.headdict['version']+' | Craftname: '+self.headdict['craftName']+\
-            ' | meanFreq: '+str(int(meanfreq))+' | rcRate/Expo: '+self.headdict['rcRate']+'/'+ self.headdict['rcExpo']+'\nrcYawRate/Expo: '+self.headdict['rcYawRate']+'/' \
-            +self.headdict['rcYawExpo']+' | deadBand: '+self.headdict['deadBand']+' | yawDeadBand: '+self.headdict['yawDeadBand'] \
-            +' | Throttle min/tpa/max: ' + self.headdict['minThrottle']+'/'+self.headdict['tpa_breakpoint']+'/'+self.headdict['maxThrottle'] \
-            + ' | dynThrPID: ' + self.headdict['dynThrottle']+ '| D-TermSP: ' + self.headdict['dTermSetPoint']+'| vbatComp: ' + self.headdict['vbatComp']
+        t = (Version +
+             " | Betaflight: Version " +
+             self.headdict['version'] +
+             ' | Craftname: ' +
+             self.headdict['craftName'] +
+             ' | meanFreq: ' +
+             str(int(meanfreq)) +
+             ' | rcRate/Expo: ' +
+             self.headdict['rcRate'] +
+             '/' +
+             self.headdict['rcExpo'] +
+             '\nrcYawRate/Expo: ' +
+             self.headdict['rcYawRate'] +
+             '/' +
+             self.headdict['rcYawExpo'] +
+             ' | deadBand: ' +
+             self.headdict['deadBand'] +
+             ' | yawDeadBand: ' +
+             self.headdict['yawDeadBand'] +
+             ' | Throttle min/tpa/max: ' +
+             self.headdict['minThrottle'] +
+             '/' +
+             self.headdict['tpa_breakpoint'] +
+             '/' +
+             self.headdict['maxThrottle'] +
+             ' | dynThrPID: ' +
+             self.headdict['dynThrottle'] +
+             '| D-TermSP: ' +
+             self.headdict['dTermSetPoint'] +
+             '| vbatComp: ' +
+             self.headdict['vbatComp'])
 
-        plt.text(0, 0, t, ha='left', va='center', rotation=90, color='grey', alpha=0.5, fontsize=textsize)
+        plt.text(0, 0, t,
+                 ha='left',
+                 va='center',
+                 rotation=90,
+                 color='grey',
+                 alpha=0.5,
+                 fontsize=textsize)
         ax4.axis('off')
         logging.info('Saving as image...')
-        plt.savefig(self.file[:-13] + self.name + '_' + str(self.headdict['logNum'])+'_response.png')
+        plt.savefig(self.file[:-13] + self.name + '_' + str(self.headdict['logNum']) + '_response.png')
         return fig
 
     def __analyze(self):
         analyzed = []
         for t in self.traces:
             logging.info(t['name'] + '...   ')
-            analyzed.append(Trace(t))
+            analyzed.append(Trace(t, keep=self.keep, response_compare=self.response_compare))
         return analyzed
 
     def readcsv(self, fpath):
-        logging.info('Reading: Log '+str(self.headdict['logNum']))
+        logging.info('Reading: Log ' + str(self.headdict['logNum']))
         datdic = {}
-        ### keycheck for 'usecols' only reads usefull traces, uncommend if needed
-        wanted =  ['time (us)',
-                   'rcCommand[0]', 'rcCommand[1]', 'rcCommand[2]', 'rcCommand[3]',
-                   'axisP[0]','axisP[1]','axisP[2]',
-                   'axisI[0]', 'axisI[1]', 'axisI[2]',
-                   'axisD[0]', 'axisD[1]','axisD[2]',
-                   'gyroADC[0]', 'gyroADC[1]', 'gyroADC[2]',
-                   'gyroData[0]', 'gyroData[1]', 'gyroData[2]',
-                   'ugyroADC[0]', 'ugyroADC[1]', 'ugyroADC[2]',
-                   #'accSmooth[0]','accSmooth[1]', 'accSmooth[2]',
-                   'debug[0]', 'debug[1]', 'debug[2]','debug[3]',
-                   #'motor[0]', 'motor[1]', 'motor[2]', 'motor[3]',
-                   #'energyCumulative (mAh)','vbatLatest (V)', 'amperageLatest (A)'
-                   ]
-        data = read_csv(fpath, header=0, skipinitialspace=1, usecols=lambda k: k in wanted, dtype=np.float64)
+        # keycheck for 'usecols' only reads usefull traces, uncommend if needed
+        wanted = ['time (us)',
+                  'rcCommand[0]', 'rcCommand[1]', 'rcCommand[2]', 'rcCommand[3]',
+                  'axisP[0]', 'axisP[1]', 'axisP[2]',
+                  'axisI[0]', 'axisI[1]', 'axisI[2]',
+                  'axisD[0]', 'axisD[1]', 'axisD[2]',
+                  'gyroADC[0]', 'gyroADC[1]', 'gyroADC[2]',
+                  'gyroData[0]', 'gyroData[1]', 'gyroData[2]',
+                  'ugyroADC[0]', 'ugyroADC[1]', 'ugyroADC[2]',
+                  # 'accSmooth[0]','accSmooth[1]', 'accSmooth[2]',
+                  'debug[0]', 'debug[1]', 'debug[2]', 'debug[3]',
+                  # 'motor[0]', 'motor[1]', 'motor[2]', 'motor[3]',
+                  # 'energyCumulative (mAh)','vbatLatest (V)', 'amperageLatest (A)'
+                  ]
+        data = read_csv(fpath,
+                        header=0,
+                        skipinitialspace=1,
+                        usecols=lambda k: k in wanted,
+                        dtype=np.float64)
         datdic.update({'time_us': data['time (us)'].values * 1e-6})
         datdic.update({'throttle': data['rcCommand[3]'].values})
 
         for i in ['0', '1', '2']:
-            datdic.update({'rcCommand' + i: data['rcCommand['+i+']'].values})
-            #datdic.update({'PID loop in' + i: data['axisP[' + i + ']'].values})
+            datdic.update({'rcCommand' + i: data['rcCommand[%s]' % i].values})
+            # datdic.update({'PID loop in' + i: data['axisP[%s]' % i].values})
             try:
-                datdic.update({'debug' + i: data['debug[' + i + ']'].values})
-            except:
-                logging.warning('No debug['+str(i)+'] trace found!')
-                datdic.update({'debug' + i: np.zeros_like(data['rcCommand[' + i + ']'].values)})
+                datdic.update({'debug' + i: data['debug[%s]' % i].values})
+            except Exception:
+                logging.warning('No debug[%s] trace found!' % i)
+                datdic.update({'debug' + i: np.zeros_like(data['rcCommand[%s]' % i].values)})
 
             # get P trace (including case of missing trace)
             try:
                 datdic.update({'PID loop in' + i: data['axisP[' + i + ']'].values})
-            except:
-                logging.warning('No P['+str(i)+'] trace found!')
-                datdic.update({'PID loop in' + i: np.zeros_like(data['rcCommand[' + i + ']'].values)})
+            except Exception:
+                logging.warning('No P[%s] trace found!' % i)
+                datdic.update({'PID loop in' + i: np.zeros_like(data['rcCommand[%s]' % i].values)})
 
             try:
-                datdic.update({'d_err'+i: data['axisD[' + i+']'].values})
-            except:
-                logging.warning('No D['+str(i)+'] trace found!')
-                datdic.update({'d_err' + i: np.zeros_like(data['rcCommand[' + i + ']'].values)})
+                datdic.update({'d_err' + i: data['axisD[%s]' % i].values})
+            except Exception:
+                logging.warning('No D[%s] trace found!' % i)
+                datdic.update({'d_err' + i: np.zeros_like(data['rcCommand[%s]' % i].values)})
 
             try:
-                datdic.update({'I_term'+i: data['axisI[' + i+']'].values})
-            except:
-                if i<2:
-                    logging.warning('No I['+str(i)+'] trace found!')
-                datdic.update({'I_term' + i: np.zeros_like(data['rcCommand[' + i + ']'].values)})
+                datdic.update({'I_term' + i: data['axisI[%s]' % i].values})
+            except Exception:
+                if i < 2:
+                    logging.warning('No I[%s] trace found!' % i)
+                datdic.update({'I_term' + i: np.zeros_like(data['rcCommand[%s]' % i].values)})
 
-            datdic.update({'PID sum' + i: datdic['PID loop in'+i]+datdic['I_term'+i]+datdic['d_err'+i]})
+            datdic.update({'PID sum' + i: (datdic['PID loop in' + i] +
+                                           datdic['I_term' + i] +
+                                           datdic['d_err' + i])})
             if 'gyroADC[0]' in data.keys():
-                datdic.update({'gyroData' + i: data['gyroADC[' + i+']'].values})
+                datdic.update({'gyroData' + i: data['gyroADC[%s]' % i].values})
             elif 'gyroData[0]' in data.keys():
-                datdic.update({'gyroData' + i: data['gyroData[' + i+']'].values})
+                datdic.update({'gyroData' + i: data['gyroData[%s]' % i].values})
             elif 'ugyroADC[0]' in data.keys():
-                datdic.update({'gyroData' + i: data['ugyroADC[' + i+']'].values})
+                datdic.update({'gyroData' + i: data['ugyroADC[%s]' % i].values})
             else:
                 logging.warning('No gyro trace found!')
         return datdic
-
 
     def find_traces(self, dat):
         time = self.data['time_us']
@@ -740,14 +987,16 @@ class CSV_log:
 
         throt = ((throttle - 1000.) / (float(self.headdict['maxThrottle']) - 1000.)) * 100.
 
-        traces = [{'name':'roll'},{'name':'pitch'},{'name':'yaw'}]
+        traces = [{'name': 'roll'},
+                  {'name': 'pitch'},
+                  {'name': 'yaw'}]
 
         for i, dic in enumerate(traces):
-            dic.update({'time':time})
-            dic.update({'p_err':dat['PID loop in'+str(i)]})
+            dic.update({'time': time})
+            dic.update({'p_err': dat['PID loop in' + str(i)]})
             dic.update({'rcinput': dat['rcCommand' + str(i)]})
-            dic.update({'gyro':dat['gyroData'+str(i)]})
-            dic.update({'PIDsum':dat['PID sum'+str(i)]})
+            dic.update({'gyro': dat['gyroData' + str(i)]})
+            dic.update({'PIDsum': dat['PID sum' + str(i)]})
             dic.update({'d_err': dat['d_err' + str(i)]})
             dic.update({'debug': dat['debug' + str(i)]})
             if 'KISS' in self.headdict['fwType']:
@@ -758,23 +1007,26 @@ class CSV_log:
                 self.headdict.update({'tpa_percent': 0.})
 
             else:
-                dic.update({'P':float((self.headdict[dic['name']+'PID']).split(',')[0])})
-                self.headdict.update({'tpa_percent': (float(self.headdict['tpa_breakpoint']) - 1000.) / 10.})
+                dic.update({'P': float((self.headdict[dic['name'] + 'PID']).split(',')[0])})
+                self.headdict.update(
+                    {'tpa_percent': (float(self.headdict['tpa_breakpoint']) - 1000.) / 10.})
 
-            dic.update({'throttle':throt})
+            dic.update({'throttle': throt})
 
         return traces
 
 
 class BB_log:
-    def __init__(self, log_file_path, name, blackbox_decode, show, noise_bounds):
+    def __init__(self, log_file_path, name, blackbox_decode, show, noise_bounds, response_compare, keep):
         self.blackbox_decode_bin_path = blackbox_decode
         self.tmp_dir = os.path.join(os.path.dirname(log_file_path), name)
         if not os.path.isdir(self.tmp_dir):
             os.makedirs(self.tmp_dir)
         self.name = name
-        self.show=show
-        self.noise_bounds=noise_bounds
+        self.show = show
+        self.noise_bounds = noise_bounds
+        self.response_compare = response_compare
+        self.keep = keep
 
         self.loglist = self.decode(log_file_path)
         self.heads = self.beheader(self.loglist)
@@ -783,21 +1035,26 @@ class BB_log:
         self.deletejunk(self.loglist)
 
     def deletejunk(self, loglist):
-        for l in loglist:
-            os.remove(l)
-            os.remove(l[:-3]+'01.csv')
+        for log in loglist:
+            os.remove(log)
+            os.remove("%s01.csv" % log[:-3])
             try:
-                os.remove(l[:-3]+'01.event')
-            except:
-                logging.warning('No .event file of '+l+' found.')
+                os.remove("%s01.event" % log[:-3])
+            except Exception:
+                logging.warning('No .event file of %s found.' % log)
         return
 
     def _csv_iter(self, heads):
         figs = []
         for h in heads:
-            analysed = CSV_log(h['tempFile'][:-3]+'01.csv', self.name, h, self.noise_bounds)
-            #figs.append([analysed.fig_resp,analysed.fig_noise])
-            if self.show!='Y':
+            analysed = CSV_log(fpath=h['tempFile'][:-3] + '01.csv',
+                               name=self.name,
+                               headdict=h,
+                               noise_bounds=self.noise_bounds,
+                               response_compare=self.response_compare,
+                               keep=self.keep)
+            # figs.append([analysed.fig_resp,analysed.fig_noise])
+            if self.show != 'Y':
                 plt.cla()
                 plt.clf()
         return figs
@@ -807,85 +1064,93 @@ class BB_log:
         for i, bblog in enumerate(loglist):
             log = open(os.path.join(self.tmp_dir, bblog), 'rb')
             lines = log.readlines()
-            ### in case info is not provided by log, empty str is printed in plot
-            headsdict = {'tempFile'     :'',
-                         'dynThrottle' :'',
-                         'craftName'   :'',
-                         'fwType': '',
-                         'version'     :'',
-                         'date'        :'',
-                         'rcRate'      :'',
-                         'rcExpo'       :'',
-                         'rcYawExpo'    :'',
-                         'rcYawRate'   :'',
-                         'rates'        :'',
-                         'rollPID'     :'',
-                         'pitchPID'    :'',
-                         'yawPID'      :'',
-                         'deadBand'    :'',
-                         'yawDeadBand' :'',
-                         'logNum'       :'',
-                         'tpa_breakpoint':'0',
-                         'minThrottle':'',
-                         'maxThrottle': '',
-                         'tpa_percent':'',
-                         'dTermSetPoint':'',
-                         'vbatComp':'',
-                         'gyro_lpf':'',
-                         'gyro_lowpass_type':'',
-                         'gyro_lowpass_hz':'',
-                         'gyro_notch_hz':'',
-                         'gyro_notch_cutoff':'',
-                         'dterm_filter_type':'',
-                         'dterm_lpf_hz':'',
-                         'yaw_lpf_hz':'',
-                         'dterm_notch_hz':'',
-                         'dterm_notch_cutoff':'',
-                         'debug_mode':''
-                         }
-            ### different versions of fw have different names for the same thing.
-            translate_dic={'dynThrPID:':'dynThrottle',
-                         'Craft name:':'craftName',
-                         'Firmware type:':'fwType',
-                         'Firmware revision:':'version',
-                         'Firmware date:':'fwDate',
-                         'rcRate:':'rcRate', 'rc_rate:':'rcRate',
-                         'rcExpo:':'rcExpo', 'rc_expo:':'rcExpo',
-                         'rcYawExpo:':'rcYawExpo', 'rc_expo_yaw:':'rcYawExpo',
-                         'rcYawRate:':'rcYawRate', 'rc_rate_yaw:':'rcYawRate',
-                         'rates:':'rates',
-                         'rollPID:':'rollPID',
-                         'pitchPID:':'pitchPID',
-                         'yawPID:':'yawPID',
-                         ' deadband:':'deadBand',
-                         'yaw_deadband:':'yawDeadBand',
-                         'tpa_breakpoint:':'tpa_breakpoint',
-                         'minthrottle:':'minThrottle',
-                         'maxthrottle:':'maxThrottle',
-                         'dtermSetpointWeight:':'dTermSetPoint','dterm_setpoint_weight:':'dTermSetPoint',
-                         'vbat_pid_compensation:':'vbatComp','vbat_pid_gain:':'vbatComp',
-                         'gyro_lpf:':'gyro_lpf',
-                         'gyro_lowpass_type:':'gyro_lowpass_type',
-                         'gyro_lowpass_hz:':'gyro_lowpass_hz','gyro_lpf_hz:':'gyro_lowpass_hz',
-                         'gyro_notch_hz:':'gyro_notch_hz',
-                         'gyro_notch_cutoff:':'gyro_notch_cutoff',
-                         'dterm_filter_type:':'dterm_filter_type',
-                         'dterm_lpf_hz:':'dterm_lpf_hz',
-                         'yaw_lpf_hz:':'yaw_lpf_hz',
-                         'dterm_notch_hz:':'dterm_notch_hz',
-                         'dterm_notch_cutoff:':'dterm_notch_cutoff',
-                         'debug_mode:':'debug_mode'
-                         }
+            # in case info is not provided by log, empty str is printed in plot
+            headsdict = {
+                'tempFile': '',
+                'dynThrottle': '',
+                'craftName': '',
+                'fwType': '',
+                'version': '',
+                'date': '',
+                'rcRate': '',
+                'rcExpo': '',
+                'rcYawExpo': '',
+                'rcYawRate': '',
+                'rates': '',
+                'rollPID': '',
+                'pitchPID': '',
+                'yawPID': '',
+                'deadBand': '',
+                'yawDeadBand': '',
+                'logNum': '',
+                'tpa_breakpoint': '0',
+                'minThrottle': '',
+                'maxThrottle': '',
+                'tpa_percent': '',
+                'dTermSetPoint': '',
+                'vbatComp': '',
+                'gyro_lpf': '',
+                'gyro_lowpass_type': '',
+                'gyro_lowpass_hz': '',
+                'gyro_notch_hz': '',
+                'gyro_notch_cutoff': '',
+                'dterm_filter_type': '',
+                'dterm_lpf_hz': '',
+                'yaw_lpf_hz': '',
+                'dterm_notch_hz': '',
+                'dterm_notch_cutoff': '',
+                'debug_mode': ''}
+
+            # different versions of fw have different names for the same thing.
+            translate_dic = {
+                'dynThrPID:': 'dynThrottle',
+                'Craft name:': 'craftName',
+                'Firmware type:': 'fwType',
+                'Firmware revision:': 'version',
+                'Firmware date:': 'fwDate',
+                'rcRate:': 'rcRate',
+                'rc_rate:': 'rcRate',
+                'rcExpo:': 'rcExpo',
+                'rc_expo:': 'rcExpo',
+                'rcYawExpo:': 'rcYawExpo',
+                'rc_expo_yaw:': 'rcYawExpo',
+                'rcYawRate:': 'rcYawRate',
+                'rc_rate_yaw:': 'rcYawRate',
+                'rates:': 'rates',
+                'rollPID:': 'rollPID',
+                'pitchPID:': 'pitchPID',
+                'yawPID:': 'yawPID',
+                'deadband:': 'deadBand',
+                'yaw_deadband:': 'yawDeadBand',
+                'tpa_breakpoint:': 'tpa_breakpoint',
+                'minthrottle:': 'minThrottle',
+                'maxthrottle:': 'maxThrottle',
+                'dtermSetpointWeight:': 'dTermSetPoint',
+                'dterm_setpoint_weight:': 'dTermSetPoint',
+                'vbat_pid_compensation:': 'vbatComp',
+                'vbat_pid_gain:': 'vbatComp',
+                'gyro_lpf:': 'gyro_lpf',
+                'gyro_lowpass_type:': 'gyro_lowpass_type',
+                'gyro_lowpass_hz:': 'gyro_lowpass_hz',
+                'gyro_lpf_hz:': 'gyro_lowpass_hz',
+                'gyro_notch_hz:': 'gyro_notch_hz',
+                'gyro_notch_cutoff:': 'gyro_notch_cutoff',
+                'dterm_filter_type:': 'dterm_filter_type',
+                'dterm_lpf_hz:': 'dterm_lpf_hz',
+                'yaw_lpf_hz:': 'yaw_lpf_hz',
+                'dterm_notch_hz:': 'dterm_notch_hz',
+                'dterm_notch_cutoff:': 'dterm_notch_cutoff',
+                'debug_mode:': 'debug_mode'}
 
             headsdict['tempFile'] = bblog
             headsdict['logNum'] = str(i)
-            ### check for known keys and translate to useful ones.
+            # check for known keys and translate to useful ones.
             for raw_line in lines:
-                l = raw_line.decode('latin-1')
+                line = raw_line.decode('latin-1')
                 for k in translate_dic.keys():
-                    if k in l:
-                        val =l.split(':')[-1]
-                        headsdict.update({translate_dic[k]:val[:-1]})
+                    if k in line:
+                        val = line.split(':')[-1]
+                        headsdict.update({translate_dic[k]: val[:-1]})
 
             heads.append(headsdict)
         return heads
@@ -898,7 +1163,7 @@ class BB_log:
         # The first line of the overall BBL file re-appears at the beginning
         # of each recorded session.
         try:
-          first_newline_index = content.index(str('\n').encode('utf8'))
+            first_newline_index = content.index(str('\n').encode('utf8'))
         except ValueError as e:
             raise ValueError(
                 'No newline in %dB of log data from %r.'
@@ -913,7 +1178,7 @@ class BB_log:
             temp_path = os.path.join(
                 self.tmp_dir, '%s_temp%d%s' % (path_root, i, path_ext))
             with open(temp_path, 'wb') as newfile:
-                newfile.write(firstline+split[i])
+                newfile.write(firstline + split[i])
             bbl_sessions.append(temp_path)
 
         loglist = []
@@ -923,7 +1188,7 @@ class BB_log:
                 try:
                     msg = subprocess.check_call([self.blackbox_decode_bin_path, bbl_session])
                     loglist.append(bbl_session)
-                except:
+                except Exception:
                     logging.error(
                         'Error in Blackbox_decode of %r' % bbl_session, exc_info=True)
             else:
@@ -935,8 +1200,8 @@ class BB_log:
         return loglist
 
 
-def run_analysis(log_file_path, plot_name, blackbox_decode, show, noise_bounds):
-    test = BB_log(log_file_path, plot_name, blackbox_decode, show, noise_bounds)
+def run_analysis(*args, **kwargs):
+    test = BB_log(*args, **kwargs)
     logging.info('Analysis complete, showing plot. (Close plot to exit.)')
 
 
@@ -963,15 +1228,24 @@ if __name__ == "__main__":
         '--blackbox_decode',
         default=os.path.join(os.getcwd(), 'Blackbox_decode.exe'),
         help='Path to Blackbox_decode.exe.')
-    parser.add_argument('-s', '--show', default='Y', help='Y = show plot window when done.\nN = Do not. \nDefault = Y')
-    parser.add_argument('-nb', '--noise_bounds', default='[[1.,10.1],[1.,100.],[1.,100.],[0.,4.]]', help='bounds of plots in noise analysis. use "auto" for autoscaling. \n default=[[1.,10.1],[1.,100.],[1.,100.],[0.,4.]]')
+    parser.add_argument('-s', '--show', default='Y',
+                        help=('Y = show plot window when done.\n'
+                              'N = Do not. \n'
+                              'Default = Y'))
+    parser.add_argument('-nb', '--noise_bounds', nargs=8, type=int,
+                        default=[1, 10, 1, 100, 1, 100, 0, 4],
+                        help=('bounds of plots in noise analysis. '
+                              'use "auto" for autoscaling. \n'
+                              'Default=1,10,1,100,1,100,0,4'))
+    parser.add_argument('--response-compare-type', default='rate')
+    parser.add_argument('--response-compare-split', type=int, nargs='+', default=[500])
+    parser.add_argument('--keep', type=int, nargs='+', default=[0, 100])
     args = parser.parse_args()
 
     blackbox_decode_path = clean_path(args.blackbox_decode)
     try:
         args.noise_bounds = eval(args.noise_bounds)
-
-    except:
+    except Exception:
         args.noise_bounds = args.noise_bounds
     if not os.path.isfile(blackbox_decode_path):
         parser.error(
@@ -986,13 +1260,18 @@ if __name__ == "__main__":
 
     if args.log:
         for log_path in args.log:
-            run_analysis(clean_path(log_path), args.name, args.blackbox_decode, args.show, args.noise_bounds)
+            run_analysis(clean_path(log_path),
+                         args.name,
+                         args.blackbox_decode,
+                         args.show,
+                         args.noise_bounds,
+                         (args.response_compare_type, args.response_compare_split),
+                         args.keep)
         if args.show.upper() == 'Y':
             plt.show()
         else:
             plt.cla()
             plt.clf()
-
 
     else:
         while True:
@@ -1006,16 +1285,19 @@ if __name__ == "__main__":
                     logging.info('Goodbye!')
                     break
 
-                raw_paths = strip_quotes(raw_path).replace("''", '""').split('""')  # seperate multiple paths
+                raw_paths = (strip_quotes(raw_path)
+                             .replace("''", '""')
+                             .split('""'))  # seperate multiple paths
                 name = sinput('Optional plot name:') or args.name
                 showplt = sinput('Show plot window when done? [Y]/N') or args.show
-                noise_bounds = sinput('Bounds on noise plot: [default/last] | copy and edit | "auto"\nCurrent: '+str(args.noise_bounds)+'\n') or args.noise_bounds
+                noise_bounds = sinput(
+                    'Bounds on noise plot: [default/last] | copy and edit | "auto"\n'
+                    'Current: %s\n' % str(args.noise_bounds)) or args.noise_bounds
 
                 args.show = showplt.upper()
                 try:
-                    args.noise_bounds=eval(noise_bounds)
-
-                except:
+                    args.noise_bounds = eval(noise_bounds)
+                except Exception:
                     args.noise_bounds = noise_bounds
 
             except (EOFError, KeyboardInterrupt):
@@ -1024,7 +1306,12 @@ if __name__ == "__main__":
 
             for p in raw_paths:
                 if os.path.isfile(clean_path(p)):
-                    run_analysis(clean_path(p), name, args.blackbox_decode, args.show, args.noise_bounds)
+                    run_analysis(clean_path(p),
+                                 name,
+                                 args.blackbox_decode,
+                                 args.show,
+                                 args.noise_bounds,
+                                 (args.response_compare_type, args.response_compare_split))
                 else:
                     logging.info('No valid input path!')
             if args.show == 'Y':
