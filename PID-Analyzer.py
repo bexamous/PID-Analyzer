@@ -1311,7 +1311,8 @@ if __name__ == "__main__":
                                  args.blackbox_decode,
                                  args.show,
                                  args.noise_bounds,
-                                 (args.response_compare_type, args.response_compare_split))
+                                 (args.response_compare_type, args.response_compare_split),
+                                 args.keep)
                 else:
                     logging.info('No valid input path!')
             if args.show == 'Y':
