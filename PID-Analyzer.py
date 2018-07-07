@@ -125,10 +125,13 @@ class Trace:
             [101, self.rlen])
 
         self.responses = []
+        self.responses_len = []
         for mask in self.masks:
+            combined_masks = mask * self.toolow_mask * self.keep_mask
+            self.responses_len.append(sum(combined_masks))
             self.responses.append(
                 self.weighted_mode_avr(self.spec_sm,
-                                       mask * self.toolow_mask * self.keep_mask,
+                                       combined_masks,
                                        [-1.5, 3.5],
                                        1000))
 
@@ -771,7 +774,7 @@ class CSV_log:
 
         for i, tr in enumerate(traces):
             ax0 = plt.subplot(gs1[0:6, i * 10: i * 10 + 9])
-            plt.title(tr.name)
+            plt.title("%s - PID %s" % (tr.name, self.headdict[tr.name + 'PID']))
             plt.plot(tr.time, tr.gyro, label=tr.name + ' gyro')
             plt.plot(tr.time, tr.input, label=tr.name + ' loop input')
             plt.ylabel('degrees/second')
@@ -824,9 +827,9 @@ class CSV_log:
 
             colors = ['Blues', 'Reds', 'Greens', 'Purples', 'Oranges']
             ax3 = plt.subplot(gs1[17:, i * 10: i * 10 + 9])
-            print_pids_once = False
             for idx, response in enumerate(tr.responses):
-                theCM = plt.cm.get_cmap(colors.pop(0))
+                # Reuse colors at some point.
+                theCM = plt.cm.get_cmap(colors[idx % len(colors)])
                 theCM._init()
                 alphas = np.abs(np.linspace(0., 0.5, theCM.N, dtype=np.float64))
                 theCM._lut[:-3, -1] = alphas
@@ -835,21 +838,10 @@ class CSV_log:
                              linestyles=None,
                              antialiased=True,
                              levels=np.linspace(0, 1, 20, dtype=np.float64))
-                label = '%s %s' % (tr.name, tr.response_labels[idx])
+                label = '%s (%s)' % (tr.response_labels[idx],
+                                     tr.responses_len[idx])
 
-                if not print_pids_once:
-                    label += " PID %s" % self.headdict[tr.name + 'PID']
-                    print_pids_once = True
                 plt.plot(tr.time_resp, response[0], label=label)
-                continue
-                plt.plot(tr.time_resp, response[0],
-                         label=''.join([tr.name,
-                                        ' step response ',
-                                        '(<',
-                                        str(int(Trace.threshold)),
-                                        ') ',
-                                        ' PID ',
-                                        self.headdict[tr.name + 'PID']]))
 
             plt.xlim([-0.001, 0.501])
 
