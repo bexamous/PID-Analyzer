@@ -101,10 +101,13 @@ class Trace:
                 compare_thresholds = [int(x) for x in response_compare[1]]
 
         self.masks = self.low_high_masks(compare, compare_thresholds)
-        self.response_labels = ['%s %s-%s' % (response_compare[0],
-                                              compare_thresholds[x],
-                                              compare_thresholds[x + 1])
-                                for x in range(len(compare_thresholds) - 1)]
+
+        self.responses = []
+        for idx in range(len(compare_thresholds) - 1):
+            response_label = '%s %s-%s' % (response_compare[0],
+                                           compare_thresholds[idx],
+                                           compare_thresholds[idx + 1])
+            self.responses.append({"label": response_label})
 
         # mask for ignoring noisy low input
         self.toolow_mask = self.low_high_masks(self.max_in, [20, 10000])[0]
@@ -124,16 +127,13 @@ class Trace:
             (self.spec_sm.transpose() * self.toolow_mask).transpose(),
             [101, self.rlen])
 
-        self.responses = []
-        self.responses_len = []
-        for mask in self.masks:
+        for idx, mask in enumerate(self.masks):
             combined_masks = mask * self.toolow_mask * self.keep_mask
-            self.responses_len.append(sum(combined_masks))
-            self.responses.append(
-                self.weighted_mode_avr(self.spec_sm,
-                                       combined_masks,
-                                       [-1.5, 3.5],
-                                       1000))
+            self.responses[idx]["samples"] = sum(combined_masks)
+            self.responses[idx]["avr"] = self.weighted_mode_avr(self.spec_sm,
+                                                                combined_masks,
+                                                                [-1.5, 3.5],
+                                                                1000)
 
         # self.resp_low = self.weighted_mode_avr(self.spec_sm,
         #                                        self.low_mask * self.toolow_mask,
@@ -833,15 +833,14 @@ class CSV_log:
                 theCM._init()
                 alphas = np.abs(np.linspace(0., 0.5, theCM.N, dtype=np.float64))
                 theCM._lut[:-3, -1] = alphas
-                plt.contourf(*response[2],
+                plt.contourf(*response["avr"][2],
                              cmap=theCM,
                              linestyles=None,
                              antialiased=True,
                              levels=np.linspace(0, 1, 20, dtype=np.float64))
-                label = '%s (%s)' % (tr.response_labels[idx],
-                                     tr.responses_len[idx])
+                label = '%s (%s)' % (response["label"], response["samples"])
 
-                plt.plot(tr.time_resp, response[0], label=label)
+                plt.plot(tr.time_resp, response["avr"][0], label=label)
 
             plt.xlim([-0.001, 0.501])
 
